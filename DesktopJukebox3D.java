@@ -1,4 +1,5 @@
 import javax.swing.*;
+import javax.swing.filechooser.FileNameExtensionFilter;
 import java.awt.*;
 import java.awt.event.*;
 import java.awt.image.*;
@@ -7,11 +8,14 @@ import javax.imageio.*;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.Collections;
+import java.util.Properties;
+import javax.sound.sampled.*;
 
 public class DesktopJukebox3D extends JFrame {
 
     private static final int LOGICAL_WIDTH = 400;
     private static final int LOGICAL_HEIGHT = 400;
+    private static final String CONFIG_FILE = "jukebox.properties";
 
     public DesktopJukebox3D() {
         setUndecorated(true);
@@ -20,8 +24,9 @@ public class DesktopJukebox3D extends JFrame {
         setSize(LOGICAL_WIDTH, LOGICAL_HEIGHT);
         setResizable(false);
         setDefaultCloseOperation(EXIT_ON_CLOSE);
-        setLocationRelativeTo(null);
         add(new CubePanel());
+        loadWindowState();
+        setVisible(true);
     }
 
     class CubePanel extends JPanel {
@@ -38,50 +43,51 @@ public class DesktopJukebox3D extends JFrame {
                 {-1, -1, -1}, { 1, -1, -1}, { 1,  1, -1}, {-1,  1, -1},
                 {-1, -1,  1}, { 1, -1,  1}, { 1,  1,  1}, {-1,  1,  1}
         };
-
         private final int[][] faces = {
-                {3, 7, 6, 2},
-                {0, 1, 5, 4},
-                {4, 5, 6, 7},
-                {0, 3, 2, 1},
-                {0, 4, 7, 3},
-                {1, 2, 6, 5}
+                {3, 7, 6, 2}, {0, 1, 5, 4}, {4, 5, 6, 7},
+                {0, 3, 2, 1}, {0, 4, 7, 3}, {1, 2, 6, 5}
         };
-
         private final Color[] faceColors = {
                 Color.RED, Color.GREEN, Color.BLUE,
                 Color.YELLOW, Color.CYAN, Color.MAGENTA
         };
-
         private float rotX = 0.4f;
         private float rotY = 0.6f;
         private boolean leftMouseDown = false;
         private java.awt.Point lastMouse;
-
         private final float scale = 130;
         private final float distance = 5f;
         private static final float CUBE_SCALE = 0.425f;
-
         private BufferedImage renderBuffer;
         private Graphics2D bufferG2;
 
         private final ArrayList<Note> notes = new ArrayList<>();
         private long lastNoteSpawn = 0;
         private static final long SPAWN_INTERVAL = 350;
-        private boolean notesSpawnEnabled = true;
-
-        // UI 工具栏：5 个按钮
-        private final ArrayList<UiButton> uiButtons = new ArrayList<>();
-        private boolean uiShown = false;
+        private boolean notesSpawnEnabled = false;
+        private static final Color NOTE_COLOR = new Color(20, 130, 70);
 
         private final WindowDragPos windowDrag = new WindowDragPos();
 
-        private static final Color NOTE_COLOR = new Color(20, 130, 70);
+        private final ArrayList<File> playlist = new ArrayList<>();
+        private int currentTrackIndex = 0;
+        private boolean isPlaying = false;
+        private enum LoopMode { ALL, ONE, OFF }
+        private LoopMode loopMode = LoopMode.ALL;
+        private AudioPlayer audioPlayer;
+
+        private final ArrayList<UiButton> uiButtons = new ArrayList<>();
+        private boolean uiShown = false;
+        private static final int BTN_RADIUS = 28;
+        private static final int UI_Y = 70;
 
         public CubePanel() {
             setOpaque(false);
             setFocusable(true);
             requestFocusInWindow();
+
+            audioPlayer = new AudioPlayer();
+            initUiButtons();
 
             File baseDir = new File(System.getProperty("user.dir"));
             try {
@@ -108,21 +114,36 @@ public class DesktopJukebox3D extends JFrame {
             addMouseListener(new MouseAdapter() {
                 @Override
                 public void mousePressed(MouseEvent e) {
-                    if (SwingUtilities.isLeftMouseButton(e)) {
-                        leftMouseDown = true;
-                        lastMouse = e.getPoint();
-                    } else if (SwingUtilities.isRightMouseButton(e)) {
+                    int mx = e.getX();
+                    int my = e.getY();
+
+                    if (SwingUtilities.isMiddleMouseButton(e)) {
+                        uiShown = !uiShown;
+                        if (uiShown) resetUiAnimation();
+                        return;
+                    }
+
+                    if (SwingUtilities.isRightMouseButton(e)) {
                         Window window = SwingUtilities.getWindowAncestor(CubePanel.this);
                         windowDrag.screenX = e.getXOnScreen();
                         windowDrag.screenY = e.getYOnScreen();
                         windowDrag.windowX = window.getLocation().x;
                         windowDrag.windowY = window.getLocation().y;
-                    } else if (SwingUtilities.isMiddleMouseButton(e)) {
-                        // 中键：显示/保持 UI 工具栏
-                        showUiToolbar();
-                    } else {
-                        // 其他按键点击：隐藏 UI
-                        hideUiToolbar();
+                        return;
+                    }
+
+                    if (SwingUtilities.isLeftMouseButton(e)) {
+                        if (uiShown) {
+                            UiButton clicked = getClickedButton(mx, my);
+                            if (clicked != null) {
+                                doButtonAction(clicked.type);
+                                return;
+                            } else {
+                                uiShown = false;
+                            }
+                        }
+                        leftMouseDown = true;
+                        lastMouse = e.getPoint();
                     }
                 }
 
@@ -153,33 +174,12 @@ public class DesktopJukebox3D extends JFrame {
                 }
             });
 
-            addKeyListener(new KeyAdapter() {
-                @Override
-                public void keyPressed(KeyEvent e) {
-                    if (e.getKeyCode() == KeyEvent.VK_SPACE) {
-                        notesSpawnEnabled = !notesSpawnEnabled;
-                    }
-                }
-            });
-
             new javax.swing.Timer(16, e -> repaint()).start();
         }
 
-        private void showUiToolbar() {
-            if (uiShown) return;
-
+        private void initUiButtons() {
             uiButtons.clear();
-
-            // 5 个 UI 按钮位置：在方块上方横向扇形排列
-            // 注意：这里的坐标是方块局部坐标，不随视角旋转
-            float[][] targets = {
-                    {-0.90f, 1.50f, 0f},
-                    {-0.45f, 1.55f, 0f},
-                    { 0.00f, 1.60f, 0f},
-                    { 0.45f, 1.55f, 0f},
-                    { 0.90f, 1.50f, 0f}
-            };
-
+            int[] xs = {50, 130, 200, 270, 350};
             UiButtonType[] types = {
                     UiButtonType.FOLDER,
                     UiButtonType.PREV,
@@ -187,40 +187,243 @@ public class DesktopJukebox3D extends JFrame {
                     UiButtonType.NEXT,
                     UiButtonType.LOOP
             };
-
             for (int i = 0; i < 5; i++) {
                 UiButton btn = new UiButton();
-                btn.targetX = targets[i][0];
-                btn.targetY = targets[i][1];
-                btn.targetZ = targets[i][2];
+                btn.x = xs[i];
+                btn.y = UI_Y;
+                btn.radius = BTN_RADIUS;
                 btn.type = types[i];
                 btn.progress = 0f;
                 uiButtons.add(btn);
             }
-
-            uiShown = true;
         }
 
-        private void hideUiToolbar() {
-            if (!uiShown) return;
-            uiShown = false;
-            uiButtons.clear();
+        private void resetUiAnimation() {
+            for (UiButton btn : uiButtons) {
+                btn.progress = 0f;
+            }
+        }
+
+        private UiButton getClickedButton(int mx, int my) {
+            for (UiButton btn : uiButtons) {
+                double dist = Math.hypot(mx - btn.x, my - btn.y);
+                if (dist <= btn.radius) {
+                    return btn;
+                }
+            }
+            return null;
+        }
+
+        private void doButtonAction(UiButtonType type) {
+            switch (type) {
+                case FOLDER: chooseMusicFolder(); break;
+                case PREV: playPrev(); break;
+                case PAUSE:
+                case PLAY: togglePlayPause(); break;
+                case NEXT: playNext(); break;
+                case LOOP: toggleLoopMode(); break;
+            }
+        }
+
+        private void chooseMusicFolder() {
+            JFileChooser chooser = new JFileChooser();
+            chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+            chooser.setDialogTitle("选择音乐文件夹");
+
+            File lastFolder = getLastMusicFolder();
+            if (lastFolder != null && lastFolder.exists()) {
+                chooser.setSelectedFile(lastFolder);
+            }
+
+            int result = chooser.showOpenDialog(this);
+            if (result == JFileChooser.APPROVE_OPTION) {
+                File folder = chooser.getSelectedFile();
+                scanMusicFiles(folder);
+                saveMusicFolder(folder.getAbsolutePath());
+
+                if (!playlist.isEmpty()) {
+                    currentTrackIndex = 0;
+                    playCurrentTrack();
+                } else {
+                    JOptionPane.showMessageDialog(this,
+                            "文件夹内没有找到 mp3/ogg/wav 文件",
+                            "提示",
+                            JOptionPane.WARNING_MESSAGE);
+                }
+            }
+        }
+
+        private void scanMusicFiles(File folder) {
+            playlist.clear();
+            File[] files = folder.listFiles((dir, name) -> {
+                String lower = name.toLowerCase();
+                return lower.endsWith(".mp3") || lower.endsWith(".ogg") || lower.endsWith(".wav");
+            });
+            if (files != null) {
+                Collections.addAll(playlist, files);
+            }
+        }
+
+        private void playCurrentTrack() {
+            if (playlist.isEmpty()) return;
+            File track = playlist.get(currentTrackIndex);
+            audioPlayer.play(track);
+            isPlaying = true;
+            notesSpawnEnabled = true;
+            uiButtons.get(2).type = UiButtonType.PAUSE;
+        }
+
+        private void playPrev() {
+            if (playlist.isEmpty()) return;
+            currentTrackIndex = (currentTrackIndex - 1 + playlist.size()) % playlist.size();
+            playCurrentTrack();
+        }
+
+        private void playNext() {
+            if (playlist.isEmpty()) return;
+            currentTrackIndex = (currentTrackIndex + 1) % playlist.size();
+            playCurrentTrack();
+        }
+
+        private void togglePlayPause() {
+            if (playlist.isEmpty()) {
+                JOptionPane.showMessageDialog(this, "请先选择音乐文件夹", "提示", JOptionPane.INFORMATION_MESSAGE);
+                return;
+            }
+            if (isPlaying) {
+                audioPlayer.pause();
+                isPlaying = false;
+                notesSpawnEnabled = false;
+                uiButtons.get(2).type = UiButtonType.PLAY;
+            } else {
+                audioPlayer.resume();
+                isPlaying = true;
+                notesSpawnEnabled = true;
+                uiButtons.get(2).type = UiButtonType.PAUSE;
+            }
+        }
+
+        private void toggleLoopMode() {
+            LoopMode[] values = LoopMode.values();
+            int ord = (loopMode.ordinal() + 1) % values.length;
+            loopMode = values[ord];
+        }
+
+        private void onTrackFinished() {
+            SwingUtilities.invokeLater(() -> {
+                switch (loopMode) {
+                    case ONE:
+                        playCurrentTrack();
+                        break;
+                    case ALL:
+                        if (currentTrackIndex < playlist.size() - 1) {
+                            playNext();
+                        } else {
+                            isPlaying = false;
+                            notesSpawnEnabled = false;
+                            uiButtons.get(2).type = UiButtonType.PLAY;
+                        }
+                        break;
+                    case OFF:
+                        isPlaying = false;
+                        notesSpawnEnabled = false;
+                        uiButtons.get(2).type = UiButtonType.PLAY;
+                        break;
+                }
+            });
+        }
+
+        class AudioPlayer {
+            private SourceDataLine line;
+            private Thread playThread;
+            private volatile boolean paused;
+            private volatile boolean stopped;
+
+            public void play(File audioFile) {
+                stop();
+                paused = false;
+                stopped = false;
+
+                playThread = new Thread(() -> {
+                    try {
+                        AudioInputStream rawAis = AudioSystem.getAudioInputStream(audioFile);
+                        AudioFormat baseFormat = rawAis.getFormat();
+
+                        AudioFormat targetFormat = new AudioFormat(
+                                AudioFormat.Encoding.PCM_SIGNED,
+                                baseFormat.getSampleRate(),
+                                16,
+                                baseFormat.getChannels(),
+                                baseFormat.getChannels() * 2,
+                                baseFormat.getSampleRate(),
+                                false
+                        );
+
+                        AudioInputStream decodedAis = AudioSystem.getAudioInputStream(targetFormat, rawAis);
+                        DataLine.Info info = new DataLine.Info(SourceDataLine.class, targetFormat);
+                        line = (SourceDataLine) AudioSystem.getLine(info);
+                        line.open(targetFormat);
+                        line.start();
+
+                        byte[] buffer = new byte[4096];
+                        int bytesRead;
+                        while (!stopped && (bytesRead = decodedAis.read(buffer)) != -1) {
+                            while (paused && !stopped) {
+                                Thread.sleep(10);
+                            }
+                            if (stopped) break;
+                            line.write(buffer, 0, bytesRead);
+                        }
+
+                        if (!stopped) {
+                            line.drain();
+                            onTrackFinished();
+                        }
+
+                        line.close();
+                        decodedAis.close();
+                        rawAis.close();
+
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    }
+                });
+                playThread.setDaemon(true);
+                playThread.start();
+            }
+
+            public void pause() {
+                paused = true;
+            }
+
+            public void resume() {
+                paused = false;
+            }
+
+            public void stop() {
+                stopped = true;
+                paused = false;
+                if (line != null && line.isRunning()) {
+                    line.stop();
+                    line.close();
+                }
+                if (playThread != null) {
+                    playThread.interrupt();
+                }
+            }
         }
 
         private BufferedImage tintImage(BufferedImage src, Color color) {
             int w = src.getWidth();
             int h = src.getHeight();
             BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
-
             int targetR = color.getRed();
             int targetG = color.getGreen();
             int targetB = color.getBlue();
-
             for (int y = 0; y < h; y++) {
                 for (int x = 0; x < w; x++) {
                     int rgb = src.getRGB(x, y);
                     int a = (rgb >> 24) & 0xff;
-
                     if (a <= 0) {
                         out.setRGB(x, y, 0);
                     } else {
@@ -228,11 +431,9 @@ public class DesktopJukebox3D extends JFrame {
                                           ((rgb >> 8) & 0xff) * 0.587 +
                                           (rgb & 0xff) * 0.114);
                         gray = Math.max(0, Math.min(255, gray));
-
                         int r = targetR * gray / 255;
                         int g = targetG * gray / 255;
                         int b = targetB * gray / 255;
-
                         out.setRGB(x, y, (a << 24) | (r << 16) | (g << 8) | b);
                     }
                 }
@@ -244,7 +445,6 @@ public class DesktopJukebox3D extends JFrame {
             x *= CUBE_SCALE;
             y *= CUBE_SCALE;
             z *= CUBE_SCALE;
-
             float x1 = (float) (x * Math.cos(rotY) - z * Math.sin(rotY));
             float z1 = (float) (x * Math.sin(rotY) + z * Math.cos(rotY));
             float y1 = (float) (y * Math.cos(rotX) - z1 * Math.sin(rotX));
@@ -310,14 +510,6 @@ public class DesktopJukebox3D extends JFrame {
                 if (n.life <= 0) noteIt.remove();
             }
 
-            // 更新 UI 按钮展开动画
-            for (UiButton btn : uiButtons) {
-                if (btn.progress < 1f) {
-                    btn.progress += 0.025f;
-                    if (btn.progress > 1f) btn.progress = 1f;
-                }
-            }
-
             float[][] rotated = new float[v.length][3];
             float[][] projected = new float[v.length][4];
             for (int i = 0; i < v.length; i++) {
@@ -363,7 +555,6 @@ public class DesktopJukebox3D extends JFrame {
                     float[] worldPos = rotate(n.x, n.y, n.z);
                     float[] proj = project(worldPos[0], worldPos[1], worldPos[2]);
                     double depth = proj[2];
-
                     final float sx = proj[0] * 2;
                     final float sy = proj[1] * 2;
                     final float life = n.life;
@@ -380,27 +571,6 @@ public class DesktopJukebox3D extends JFrame {
                 }
             }
 
-            // UI 按钮：固定在方块上方，不随视角旋转
-            for (UiButton btn : uiButtons) {
-                float ease = 1 - (float) Math.pow(1 - btn.progress, 3);
-                float drawX = btn.targetX;
-                float drawY = btn.targetY;
-                float drawZ = btn.targetZ;
-
-                float[] worldPos = rotate(drawX, drawY, drawZ);
-                float[] proj = project(worldPos[0], worldPos[1], worldPos[2]);
-                double depth = proj[2];
-
-                final float sx = proj[0] * 2;
-                final float sy = proj[1] * 2;
-                final float alpha = ease;
-                final UiButtonType type = btn.type;
-
-                drawList.add(new DrawElement(depth, () -> {
-                    drawUiButton(sx, sy, alpha, type);
-                }));
-            }
-
             Collections.sort(drawList);
             for (DrawElement e : drawList) {
                 e.draw.run();
@@ -412,84 +582,103 @@ public class DesktopJukebox3D extends JFrame {
                     RenderingHints.VALUE_ANTIALIAS_ON);
             g2.drawImage(renderBuffer, 0, 0, LOGICAL_WIDTH, LOGICAL_HEIGHT, null);
 
+            if (uiShown) {
+                draw2dUi(g2);
+            }
+
             if (firstRender) {
                 firstRender = false;
                 System.out.println("渲染成功");
             }
         }
 
-        private void drawUiButton(float sx, float sy, float alpha, UiButtonType type) {
-            int centerX = (int) sx;
-            int centerY = (int) sy;
-            int radius = 34; // 大按钮
-            int inner = 26;
+        private void draw2dUi(Graphics2D g2) {
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g2.setStroke(new BasicStroke(2.2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
 
-            AlphaComposite ac = AlphaComposite.getInstance(AlphaComposite.SRC_OVER, alpha);
-            bufferG2.setComposite(ac);
+            for (UiButton btn : uiButtons) {
+                if (btn.progress < 1f) {
+                    btn.progress += 0.03f;
+                    if (btn.progress > 1f) btn.progress = 1f;
+                }
+                float ease = 1 - (float) Math.pow(1 - btn.progress, 3);
+                float alpha = ease;
+                float scale = 0.5f + 0.5f * ease;
 
-            // 外圈
-            bufferG2.setColor(new Color(255, 255, 255, 230));
-            bufferG2.fillOval(centerX - radius, centerY - radius, radius * 2, radius * 2);
+                int cx = btn.x;
+                int cy = btn.y;
+                int r = (int)(btn.radius * scale);
 
-            // 内圈
-            bufferG2.setColor(new Color(245, 245, 245, 255));
-            bufferG2.fillOval(centerX - inner, centerY - inner, inner * 2, inner * 2);
+                AlphaComposite ac = AlphaComposite.getInstance(AlphaComposite.SRC_OVER, alpha);
+                g2.setComposite(ac);
 
-            // 图标线
-            bufferG2.setColor(new Color(40, 40, 40, 255));
-            bufferG2.setStroke(new BasicStroke(2.2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                g2.setColor(new Color(255, 255, 255, 230));
+                g2.fillOval(cx - r, cy - r, r * 2, r * 2);
+                g2.setColor(new Color(40, 40, 40, 255));
 
-            switch (type) {
-                case FOLDER:
-                    drawFolderIcon(centerX, centerY);
-                    break;
-                case PREV:
-                    drawPrevIcon(centerX, centerY);
-                    break;
-                case PAUSE:
-                    drawPauseIcon(centerX, centerY);
-                    break;
-                case NEXT:
-                    drawNextIcon(centerX, centerY);
-                    break;
-                case LOOP:
-                    drawLoopIcon(centerX, centerY);
-                    break;
+                switch (btn.type) {
+                    case FOLDER: drawFolderIcon(g2, cx, cy, r); break;
+                    case PREV: drawPrevIcon(g2, cx, cy, r); break;
+                    case PLAY: drawPlayIcon(g2, cx, cy, r); break;
+                    case PAUSE: drawPauseIcon(g2, cx, cy, r); break;
+                    case NEXT: drawNextIcon(g2, cx, cy, r); break;
+                    case LOOP: drawLoopIcon(g2, cx, cy, r); break;
+                }
             }
-
-            bufferG2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER));
+            g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER));
         }
 
-        private void drawFolderIcon(int cx, int cy) {
-            bufferG2.drawLine(cx - 9, cy - 7, cx - 2, cy - 7);
-            bufferG2.drawLine(cx - 2, cy - 7, cx, cy - 4);
-            bufferG2.drawLine(cx, cy - 4, cx + 9, cy - 4);
-            bufferG2.drawLine(cx + 9, cy - 4, cx + 9, cy + 8);
-            bufferG2.drawLine(cx + 9, cy + 8, cx - 9, cy + 8);
-            bufferG2.drawLine(cx - 9, cy + 8, cx - 9, cy - 7);
+        private void drawFolderIcon(Graphics2D g, int cx, int cy, int r) {
+            int s = (int)(r * 0.6);
+            g.drawRect(cx - s, cy - s/2, s*2, s);
+            g.drawLine(cx - s, cy - s/2, cx - s/2, cy - s);
+            g.drawLine(cx - s/2, cy - s, cx + s/2, cy - s);
         }
 
-        private void drawPrevIcon(int cx, int cy) {
-            bufferG2.drawLine(cx + 8, cy - 8, cx - 6, cy);
-            bufferG2.drawLine(cx - 6, cy, cx + 8, cy + 8);
-            bufferG2.drawLine(cx - 8, cy - 8, cx - 8, cy + 8);
+        private void drawPrevIcon(Graphics2D g, int cx, int cy, int r) {
+            int s = (int)(r * 0.6);
+            g.drawLine(cx + s, cy - s, cx - s/2, cy);
+            g.drawLine(cx - s/2, cy, cx + s, cy + s);
+            g.drawLine(cx - s, cy - s, cx - s, cy + s);
         }
 
-        private void drawPauseIcon(int cx, int cy) {
-            bufferG2.fillRect(cx - 7, cy - 9, 5, 18);
-            bufferG2.fillRect(cx + 2, cy - 9, 5, 18);
+        private void drawPlayIcon(Graphics2D g, int cx, int cy, int r) {
+            int s = (int)(r * 0.6);
+            int[] x = {cx - s/2, cx + s, cx - s/2};
+            int[] y = {cy - s, cy, cy + s};
+            g.fillPolygon(x, y, 3);
         }
 
-        private void drawNextIcon(int cx, int cy) {
-            bufferG2.drawLine(cx - 8, cy - 8, cx + 6, cy);
-            bufferG2.drawLine(cx + 6, cy, cx - 8, cy + 8);
-            bufferG2.drawLine(cx + 8, cy - 8, cx + 8, cy + 8);
+        private void drawPauseIcon(Graphics2D g, int cx, int cy, int r) {
+            int s = (int)(r * 0.6);
+            g.fillRect(cx - s, cy - s, s/2, s*2);
+            g.fillRect(cx + s/2, cy - s, s/2, s*2);
         }
 
-        private void drawLoopIcon(int cx, int cy) {
-            bufferG2.drawArc(cx - 9, cy - 9, 18, 18, 30, 300);
-            bufferG2.drawLine(cx + 7, cy - 7, cx + 9, cy - 9);
-            bufferG2.drawLine(cx + 7, cy - 7, cx + 5, cy - 5);
+        private void drawNextIcon(Graphics2D g, int cx, int cy, int r) {
+            int s = (int)(r * 0.6);
+            g.drawLine(cx - s, cy - s, cx + s/2, cy);
+            g.drawLine(cx + s/2, cy, cx - s, cy + s);
+            g.drawLine(cx + s, cy - s, cx + s, cy + s);
+        }
+
+        private void drawLoopIcon(Graphics2D g, int cx, int cy, int r) {
+            int s = (int)(r * 0.65);
+            g.drawArc(cx - s, cy - s, s*2, s*2, 30, 300);
+            g.drawLine(cx + s - 2, cy - s + 2, cx + s + 3, cy - s - 3);
+            g.drawLine(cx + s - 2, cy - s + 2, cx + s - 4, cy - s - 1);
+
+            if (loopMode == LoopMode.ONE) {
+                g.setFont(new Font("Dialog", Font.BOLD, s));
+                String text = "1";
+                FontMetrics fm = g.getFontMetrics();
+                int tw = fm.stringWidth(text);
+                int th = fm.getAscent();
+                g.drawString(text, cx - tw / 2, cy + th / 2);
+            } else if (loopMode == LoopMode.OFF) {
+                g.drawLine(cx - s, cy - s, cx + s, cy + s);
+                g.drawLine(cx + s, cy - s, cx - s, cy + s);
+            }
         }
 
         private void drawTexturedFace(FaceData fd, BufferedImage texture) {
@@ -571,12 +760,11 @@ public class DesktopJukebox3D extends JFrame {
             bufferG2.draw(poly);
         }
 
-        enum UiButtonType {
-            FOLDER, PREV, PAUSE, NEXT, LOOP
-        }
+        enum UiButtonType { FOLDER, PREV, PLAY, PAUSE, NEXT, LOOP }
 
         class UiButton {
-            float targetX, targetY, targetZ;
+            int x, y;
+            int radius;
             float progress;
             UiButtonType type;
         }
@@ -584,14 +772,10 @@ public class DesktopJukebox3D extends JFrame {
         class Note {
             float x, y, z;
             float life;
-
             Note(float x, float y, float z) {
-                this.x = x;
-                this.y = y;
-                this.z = z;
+                this.x = x; this.y = y; this.z = z;
                 this.life = 1.0f;
             }
-
             void update() {
                 y += 0.012f;
                 x += (Math.random() - 0.5) * 0.002f;
@@ -601,15 +785,12 @@ public class DesktopJukebox3D extends JFrame {
         }
 
         class FaceData {
-            int[] xs;
-            int[] ys;
+            int[] xs, ys;
             float[] invZs;
             int faceIndex;
             double depth;
-
             FaceData(int[] xs, int[] ys, float[] invZs, int faceIndex, double depth) {
-                this.xs = xs;
-                this.ys = ys;
+                this.xs = xs; this.ys = ys;
                 this.invZs = invZs;
                 this.faceIndex = faceIndex;
                 this.depth = depth;
@@ -619,12 +800,10 @@ public class DesktopJukebox3D extends JFrame {
         class DrawElement implements Comparable<DrawElement> {
             double depth;
             Runnable draw;
-
             DrawElement(double depth, Runnable draw) {
                 this.depth = depth;
                 this.draw = draw;
             }
-
             @Override
             public int compareTo(DrawElement o) {
                 return Double.compare(this.depth, o.depth);
@@ -632,9 +811,80 @@ public class DesktopJukebox3D extends JFrame {
         }
 
         class WindowDragPos {
-            int screenX, screenY;
-            int windowX, windowY;
+            int screenX, screenY, windowX, windowY;
         }
+    }
+
+    private Properties loadConfig() {
+        Properties props = new Properties();
+        File file = new File(CONFIG_FILE);
+        if (file.exists()) {
+            try (FileInputStream fis = new FileInputStream(file)) {
+                props.load(fis);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+        return props;
+    }
+
+    private void saveConfig(Properties props) {
+        try (FileOutputStream fos = new FileOutputStream(CONFIG_FILE)) {
+            props.store(fos, "Jukebox Config");
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void loadWindowState() {
+        Properties props = loadConfig();
+        try {
+            int x = Integer.parseInt(props.getProperty("window.x", "100"));
+            int y = Integer.parseInt(props.getProperty("window.y", "100"));
+            setLocation(x, y);
+        } catch (NumberFormatException e) {
+            setLocationRelativeTo(null);
+        }
+
+        CubePanel panel = (CubePanel) getContentPane().getComponent(0);
+        try {
+            panel.rotX = Float.parseFloat(props.getProperty("cube.rotX", "0.4"));
+            panel.rotY = Float.parseFloat(props.getProperty("cube.rotY", "0.6"));
+        } catch (NumberFormatException e) {
+        }
+    }
+
+    private void saveWindowState() {
+        Properties props = loadConfig();
+        props.setProperty("window.x", String.valueOf(getLocation().x));
+        props.setProperty("window.y", String.valueOf(getLocation().y));
+
+        CubePanel panel = (CubePanel) getContentPane().getComponent(0);
+        props.setProperty("cube.rotX", String.valueOf(panel.rotX));
+        props.setProperty("cube.rotY", String.valueOf(panel.rotY));
+
+        saveConfig(props);
+    }
+
+    private File getLastMusicFolder() {
+        Properties props = loadConfig();
+        String path = props.getProperty("music.folder");
+        if (path == null || path.isEmpty()) return null;
+        return new File(path);
+    }
+
+    private void saveMusicFolder(String path) {
+        Properties props = loadConfig();
+        props.setProperty("music.folder", path);
+        saveConfig(props);
+    }
+
+    @Override
+    protected void processWindowEvent(WindowEvent e) {
+        if (e.getID() == WindowEvent.WINDOW_CLOSING) {
+            saveWindowState();
+        }
+        super.processWindowEvent(e);
     }
 
     public static void main(String[] args) {
